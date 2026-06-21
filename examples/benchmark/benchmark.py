@@ -14,14 +14,23 @@ import parse
 
 # Parsing arguments / config
 
+
 def parseArgs():
     parser = argparse.ArgumentParser(
         prog="benchmark.py",
-        description="PureCake benchmarking. Configure using `bench.config`.")
-    parser.add_argument("--mode", choices=["collect", "plot", "compile"], default="collect",
-                        help="Mode of operation (default: %(default)s).")
-    parser.add_argument("--filestem", default="data",
-                        help="file stem to use for data/PDF output (default: %(default)s)")
+        description="PureCake benchmarking. Configure using `bench.config`.",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["collect", "plot", "compile"],
+        default="collect",
+        help="Mode of operation (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--filestem",
+        default="data",
+        help="file stem to use for data/PDF output (default: %(default)s)",
+    )
     return parser.parse_args()
 
 
@@ -34,6 +43,7 @@ def parseConfig():
 
 # Benchmarking (--mode collect)
 
+
 def compile(program, flags, heap):
     pureopt = "PUREOPT"
     cml_heap_size = "CML_HEAP_SIZE"
@@ -44,9 +54,11 @@ def compile(program, flags, heap):
     env[debug] = str(1)
     cmd = ["make", "-C", "../", program + ".exe"]
     print(
-        f"Compiling: {pureopt}='{env[pureopt]}' {cml_heap_size}='{env[cml_heap_size]}' {debug}='{env[debug]}' {' '.join(cmd)}")
-    complete = subprocess.run(["make", "-C", "../", program + ".exe"],
-                              env=env, capture_output=True)
+        f"Compiling: {pureopt}='{env[pureopt]}' {cml_heap_size}='{env[cml_heap_size]}' {debug}='{env[debug]}' {' '.join(cmd)}"
+    )
+    complete = subprocess.run(
+        ["make", "-C", "../", program + ".exe"], env=env, capture_output=True
+    )
     if complete.returncode != 0:
         print("Failed to compile program.", file=sys.stderr)
         print(complete.stderr.decode(), file=sys.stderr)
@@ -59,11 +71,15 @@ def runCommand(command):
     end = time.time()
     if complete.returncode == 0:
         lastLine = complete.stderr.decode().splitlines()[-1]
-        parsed = parse.parse("Total allocated heap data: {allocated:d} bytes", lastLine)
-        return (True, end - start, parsed.named['allocated'])
+        parsed = parse.parse(
+            "Total allocated heap data: {allocated:d} bytes", lastLine
+        )
+        return (True, end - start, parsed.named["allocated"])
     else:
-        print("Program exited with non-zero code: " +
-              str(complete.returncode), file=sys.stderr)
+        print(
+            "Program exited with non-zero code: " + str(complete.returncode),
+            file=sys.stderr,
+        )
         print(complete.stderr.decode(), file=sys.stderr)
         return (False, 0, 0)
 
@@ -82,12 +98,12 @@ def benchmark(program, inp, iterations):
 
 
 def recordRuns(results, filestem):
-    with open(filestem + ".csv", 'w') as f:
+    with open(filestem + ".csv", "w") as f:
         f.write(f"Benchmark,Flags,Time,Allocated\n")
         for program, flagResults in results.items():
             for flagGroup, data in flagResults.items():
                 for t, bs in data:
-                    f.write(f"{program},{flagGroup},{round(t,1)},{bs}\n")
+                    f.write(f"{program},{flagGroup},{round(t, 1)},{bs}\n")
 
 
 def collectData():
@@ -102,13 +118,15 @@ def collectData():
         results[program] = {}
         for flagGroup, flags in cfg["flags"].items():
             print(
-                f"\033[1mBenchmarking {program} (input: {inp}, flag group: {flagGroup})\033[0m")
+                f"\033[1mBenchmarking {program} (input: {inp}, flag group: {flagGroup})\033[0m"
+            )
             compile(program, "-final_gc " + flags, heap)
             results[program][flagGroup] = benchmark(program, inp, iters)
     return results
 
 
 # Compile all programs (--mode compile)
+
 
 def compileAll():
     cfg = parseConfig()
@@ -121,15 +139,23 @@ def compileAll():
 
 # Plot graph (--mode plot)
 
+
 def transformData(filestem):
     df = pandas.read_csv(filestem + ".csv")
     df = df.groupby(["Benchmark", "Flags"], sort=False).mean()
 
     # Extract + delete first rows of each group
-    firstRows = df.reset_index(level="Flags", drop=True).groupby(
-        "Benchmark", sort=False).first()
-    df = df.reset_index(level="Flags").groupby("Benchmark", sort=False, group_keys=False).apply(
-        lambda x: x.iloc[1:]).set_index(["Flags"], append=True)
+    firstRows = (
+        df.reset_index(level="Flags", drop=True)
+        .groupby("Benchmark", sort=False)
+        .first()
+    )
+    df = (
+        df.reset_index(level="Flags")
+        .groupby("Benchmark", sort=False, group_keys=False)
+        .apply(lambda x: x.iloc[1:])
+        .set_index(["Flags"], append=True)
+    )
 
     # Transform data
     df = df.divide(firstRows).apply(np.log2)
@@ -137,21 +163,35 @@ def transformData(filestem):
 
 
 def plotData(df):
-    df = df.reset_index().pivot_table(index="Benchmark", columns="Flags", sort=False)
+    df = df.reset_index().pivot_table(
+        index="Benchmark", columns="Flags", sort=False
+    )
 
     plt.tight_layout()
     fig, axes = plt.subplots(nrows=2, ncols=1)
-    df["Time"].plot(ax=axes[0], kind="bar", rot=0,
-                    ylabel="log2(speedup)", legend=False)
-    df["Allocated"].plot(ax=axes[1], kind="bar", rot=0,
-                  ylabel="log2(allocation reduction)", sharex=True, legend=False)
-    axes[0].legend(title="Optimisations", ncol=4,
-                   loc="upper center", bbox_to_anchor=(0.5, 1.35))
+    df["Time"].plot(
+        ax=axes[0], kind="bar", rot=0, ylabel="log2(speedup)", legend=False
+    )
+    df["Allocated"].plot(
+        ax=axes[1],
+        kind="bar",
+        rot=0,
+        ylabel="log2(allocation reduction)",
+        sharex=True,
+        legend=False,
+    )
+    axes[0].legend(
+        title="Optimisations",
+        ncol=4,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 1.35),
+    )
 
     for ax in fig.axes:
         ax.axhline(y=0, color="black", linewidth=0.1)
         ax.yaxis.set_major_formatter(
-            matplotlib.ticker.FormatStrFormatter('%.1f'))
+            matplotlib.ticker.FormatStrFormatter("%.1f")
+        )
         ax.tick_params(labelsize="small")
 
     return fig
@@ -160,6 +200,9 @@ def plotData(df):
 # Main function
 
 if __name__ == "__main__":
+    # All paths in this script (bench.config, ../, ../out/) are relative to this
+    # file's directory, so run from there regardless of the caller's cwd.
+    os.chdir(os.path.dirname(os.path.abspath(__file__)))
     args = parseArgs()
     if args.mode == "collect":
         data = collectData()
@@ -172,4 +215,3 @@ if __name__ == "__main__":
         fig.savefig(args.filestem + ".pdf")
     else:
         print("ERROR: unexpected mode")
-

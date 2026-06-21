@@ -47,7 +47,14 @@ They are compiled and typechecked only.
 
 ## Benchmarking
 
-The [`benchmark`](benchmark) directory allows simple benchmarking of PureCake as follows:
+The [`benchmark/nofib`](benchmark/nofib) directory contains a PureLang port of part
+of GHC's [`nofib`](https://github.com/ghc/nofib) suite: a set of real programs,
+each with recorded workloads and expected outputs, driven by `benchmark/nofib/run.py`.
+It serves as a broad end-to-end correctness and performance test. See
+[`benchmark/nofib/README.md`](benchmark/nofib/README.md).
+
+The [`benchmark`](benchmark) directory also allows benchmarking the effect of
+individual PureCake optimisation flags as follows:
 ```bash
 git apply benchmark/benchmark.patch
 touch lib/basis_ffi.c # ensure PureCake's FFI is rebuilt with debug output enabled

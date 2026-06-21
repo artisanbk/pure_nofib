@@ -1,0 +1,493 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{amssymb}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  frame=single,
+  framesep=4pt,
+  xleftmargin=4pt,
+  showstringspaces=false,
+}
+
+% Program / file names with literal underscores and hyphens.
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+\title{A \texttt{nofib} Benchmark Suite for PureLang\\
+       \large Design, Implementation, and Verification Notes}
+\author{PureCake \texttt{examples/benchmark/nofib}}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This document records the construction of a PureLang port of part of the GHC
+\texttt{nofib} benchmark suite, living in \code{examples/benchmark/nofib/}. It
+explains the motivation, the language and tooling constraints that shaped every
+design decision, the methodology used to write and \emph{verify} each benchmark,
+the meaning of every file in the suite, and the precise deviations from the
+original Haskell programs. The aim is that a future reader can understand not
+only \emph{what} is in the directory but \emph{why} it takes the form it does,
+and can reproduce or extend it with confidence.
+\end{abstract}
+
+\tableofcontents
+
+\section{Motivation}
+
+The \texttt{nofib} suite \cite{partain} is the long-standing collection of real
+Haskell programs used to measure lazy functional language implementations. Its
+purpose, in Partain's words, is to give implementors ``a common set of real
+\dots\ programs to attack and study'' and to enable \emph{reproducible}
+comparison. A \texttt{nofib} entry is not just a program: it is a program
+\emph{plus} a workload \emph{plus} an expected output \emph{plus} rules for
+running and reporting.
+
+PureCake is a verified compiler from PureLang---a small, lazy, Haskell-like
+language---to CakeML. Prior to this work, \code{examples/} contained a handful of
+demonstration programs and \code{examples/benchmark/} contained
+\code{benchmark.py}, which measures the effect of individual PureCake
+\emph{optimisation flags} on a few programs. What was missing was a broad,
+output-checked corpus in the style of \texttt{nofib}: a suite that exercises the
+whole compiler on a variety of real programs and that doubles as an end-to-end
+correctness test (does the compiled program still compute the right answer?) and
+a performance test (how fast, and how much heap?).
+
+The goal of this work was therefore to port as much of \texttt{nofib} as
+PureLang can faithfully express, with recorded workloads and reference outputs,
+plus a driver to compile, run, and check the suite.
+
+\section{Background: PureLang and the compilation pipeline}
+
+A PureLang program is compiled by the \code{pure} front end into a CakeML
+abstract syntax tree (serialised as an s-expression), which the \code{cake}
+compiler turns into machine code. The relevant top-level definition is
+\code{compile} in \code{compiler/pure_compilerScript.sml}; its phases are:
+parse, transform, inline, \emph{type inference} (compilation aborts if this
+fails), dead-code elimination, demand (strictness) analysis, and lowering to
+CakeML. Two consequences matter here:
+\begin{enumerate}[nosep]
+  \item The \code{pure} front end performs full type inference, so a program that
+        type-checks through \code{pure} is syntactically and statically valid.
+  \item The runnable artifact is produced by a two-stage external toolchain
+        (\code{pure} then \code{cake}), whose serialised-AST interface evolves
+        over time---a fact that materially affected our methodology
+        (\S\ref{sec:toolchain}).
+\end{enumerate}
+
+\section{Language constraints and their consequences}
+\label{sec:constraints}
+
+The shape of every benchmark is dictated by what PureLang can and cannot
+express. The authoritative reference is \code{examples/syntax.hs}; the binding
+constraints are as follows.
+
+\paragraph{Only one numeric type.}
+PureLang's sole numeric literal type is the arbitrary-precision mathematical
+\code{Integer} (confirmed in \code{language/pure_configScript.sml}, whose
+literal atoms are \code{Int} and \code{Str} only). There is no \code{Double},
+\code{Float}, or \code{Rational}. \emph{Consequence:} \texttt{nofib} programs
+that are intrinsically floating point cannot be ported; programs using
+\code{Data.Ratio} must represent rationals explicitly as reduced
+\((\textit{numerator}, \textit{denominator})\) pairs.
+
+\paragraph{No module system and no type classes.}
+There is no \code{import} mechanism, and the type-class extension to PureLang is
+work-in-progress and not available in the compiler used here. \emph{Consequence:}
+each benchmark is a single, self-contained \code{.hs} file that inlines every
+helper it uses (\code{map}, \code{foldr}, \code{toString}, \code{++}, and so on).
+There is no shared prelude, and---because there is no overloading---each file
+defines its own monomorphic \code{toString}, \code{++}, etc.
+
+\paragraph{Strings are byte arrays.}
+A PureLang \code{String} is a packed byte string (like Haskell's \code{Text}),
+not a list of characters. Character-level work is done on \code{Integer} code
+points via built-ins such as \code{#(__Elem)}, \code{#(__Len)},
+\code{#(__Concat)}, \code{#(__Implode)}, and \code{#(__Substring)}.
+\emph{Consequence:} string-processing benchmarks operate on \code{[Integer]} of
+code points and convert at the boundary.
+
+\paragraph{Input is a command-line argument, not standard input.}
+Haskell \texttt{nofib} programs read a workload from \code{stdin} (a \code{.stdin}
+file). PureLang reads \code{argv} entries through the foreign call
+\code{Act (#(cline_arg) s)}, where the argument index equals the length of the
+string \code{s}; thus \code{Act (#(cline_arg) " ")} returns \code{argv[1]}.
+\emph{Consequence:} every benchmark takes \emph{one} command-line argument that
+scales the work---an integer for most programs, a regular-expression string for
+\code{gen_regexps}.
+
+\paragraph{Strict, shallow pattern matching.}
+\code{case} is strict, scrutinee patterns are shallow (a constructor applied to
+variables; no nested constructor patterns), and matches must be exhaustive or end
+in a wildcard. There are no list comprehensions and no guard syntax.
+\emph{Consequence:} comprehensions are desugared by hand to
+\code{concatMap}/\code{filter}/\code{if}; guards become nested \code{if};
+nested patterns (e.g. \code{Wheel s ns : ws}) are split into separate
+\code{case}s. Crucially, Haskell's lazy \emph{irrefutable} patterns
+(\code{let (x:xs) = e}) have no direct equivalent, because \code{case} forces its
+scrutinee; programs that rely on them must be restructured
+(\S\ref{sec:benchmarks}).
+
+\section{Methodology}
+
+\subsection{Toolchain bring-up and the version-skew problem}
+\label{sec:toolchain}
+
+Running a PureLang program requires a \code{pure} binary (front end) and a
+\code{cake} binary (CakeML back end) that agree on the serialised-AST format.
+The \code{examples/Makefile} obtains these via \code{make download}, which
+fetches the \emph{latest} \code{pure.S} and the \emph{latest} CakeML release.
+At the time of writing these are not contemporaneous: the published
+\code{pure.S} dates from September~2024, whereas the latest \code{cake}
+release dates from June~2026, and the s-expression AST changed in between.
+Linking the latest \code{cake} additionally failed against the repository's
+\code{basis_ffi.c} because of a newer foreign symbol (\code{fficustom}).
+
+To obtain a \emph{working, self-consistent} toolchain for development and
+reference-output generation we:
+\begin{enumerate}[nosep]
+  \item used the published \code{pure.S} (Sept.\ 2024) for the front end;
+  \item downloaded a contemporaneous CakeML release (\code{v2648}, Oct.\ 2024)
+        for the back end, which both accepts that front end's output and links
+        cleanly against the existing FFI;
+  \item (only relevant to the \emph{latest} \code{cake}) noted that a one-line
+        \code{fficustom} stub resolves the link error.
+\end{enumerate}
+This is an environmental work-around, not a change to the repository. The
+suite's driver (\S\ref{sec:run}) deliberately compiles through the standard
+\code{examples/Makefile}; the README records the caveat and recommends building
+\code{pure.S} locally from \code{compiler/binary} so that it matches a
+same-vintage CakeML checkout.
+
+\subsection{Static validity signal}
+
+The \code{pure} front end exits with status~0 even on an ill-typed or
+out-of-scope program; on failure it simply emits an almost-empty s-expression
+(observed as $5$ bytes, versus thousands for a valid program). We used
+\emph{output size} from \code{pure} as the static-validity signal during
+development: a tiny output means a parse, scope, or type error. This caught the
+majority of mistakes (e.g.\ a use of \code{not} before it was defined) before
+ever invoking the back end.
+
+\subsection{Dynamic verification and reference outputs}
+
+Every benchmark was compiled \emph{and executed} end to end, and its result
+checked against an independent expectation (known mathematical values or OEIS
+sequences). Examples of the checks performed:
+\begin{itemize}[nosep]
+  \item \code{queens}: \(n=8\) yields $92$ solutions.
+  \item \code{wheel-sieve1}/\code{primes}: the $0$-indexed $n$th prime
+        (e.g.\ \code{prime 100 = 547}).
+  \item \code{paraffins}: radical counts \(1,1,1,2,4,8,17,39,89,\dots\) and
+        alkane counts \(1,1,1,2,3,5,9,18,\dots\) (OEIS A000602).
+  \item \code{bernouilli}: \(B_{12} = -691/2730\), etc.
+  \item \code{primetest}: correct primality of Mersenne numbers
+        (\(M_{13}\) prime, \(M_{11}=23\cdot 89\) composite, \dots).
+  \item \code{digits-of-e1}/\code{e2}: digits of \(e\) match
+        \(2.718281828459045\dots\).
+\end{itemize}
+The reference output files were then generated by running the verified
+executables at each workload size, not written by hand.
+
+\section{Suite structure and file formats}
+
+The suite mirrors \texttt{nofib}'s division into \textbf{imaginary} (small,
+self-contained programs) and \textbf{spectral} (algorithmic kernels). The
+\textbf{real} subset is not attempted (\S\ref{sec:notported}). The layout is:
+
+\begin{lstlisting}
+benchmark/nofib/
+  run.py                       # compile + run + check driver
+  README.md
+  imaginary/<name>/
+    <name>.hs                  # the benchmark, one self-contained file
+    sizes.cfg                  # fast / norm / slow command-line arguments
+    <name>.faststdout          # expected output for the fast workload
+    <name>.stdout              # expected output for the norm workload
+    <name>.slowstdout          # expected output for the slow workload
+  spectral/<name>/  ...        # same per-benchmark layout
+\end{lstlisting}
+
+\paragraph{\code{<name>.hs}.}
+A complete PureLang program with a \code{main :: IO ()} that reads one argument,
+performs the computation, and prints a short result line. The lower portion of
+each file is a block of standard I/O helpers (\code{fromString},
+\code{toString}, \code{implode}, \code{reverse}, \code{read_arg1}, \code{print},
+\code{++}, \texttt{\$}) copied verbatim across benchmarks, since there is no shared
+prelude.
+
+\paragraph{\code{sizes.cfg}.}
+A headerless key/value file giving the single command-line argument for each run
+mode, for example:
+\begin{lstlisting}
+# Single command-line argument supplied to tak for each run mode.
+fast = 8
+norm = 9
+slow = 10
+\end{lstlisting}
+The three modes follow \texttt{nofib}'s intent---\code{fast} for a quick smoke
+test, \code{norm} as the default (a second or two), \code{slow} for a heavier
+run.
+
+\paragraph{\code{<name>.faststdout}, \code{<name>.stdout},
+\code{<name>.slowstdout}.}
+The expected program output for the \code{fast}, \code{norm}, and \code{slow}
+workloads respectively. The naming follows \texttt{nofib} convention (where
+\code{.stdout} is the norm-mode reference). \code{run.py} selects the file
+matching the chosen mode and compares it byte-for-byte against the program's
+standard output.
+
+\section{The benchmarks}
+\label{sec:benchmarks}
+
+Table~\ref{tab:benches} lists the thirteen ported programs. The argument column
+gives the meaning of the single command-line input. The remaining subsections
+record, for the non-trivial cases, exactly how the port differs from the Haskell
+original and why.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Subset & Name & Arg & Computes \\
+\midrule
+imaginary & \code{tak}          & $n$  & \(\mathrm{tak}\,(3n)\,(2n)\,n\) (Takeuchi) \\
+imaginary & \code{rfib}         & $n$  & \(\mathrm{nfib}\,n\) (integer) \\
+imaginary & \code{exp3_8}       & $n$  & \(3^{n}\) via Peano numerals \\
+imaginary & \code{primes}       & $n$  & $n$th prime by iterated filtering \\
+imaginary & \code{queens}       & $n$  & number of $n$-queens solutions \\
+imaginary & \code{gen_regexps}  & rx   & size of a generalised-regexp expansion \\
+imaginary & \code{digits-of-e1} & $n$  & $n$ digits of $e$ (continued fraction) \\
+imaginary & \code{digits-of-e2} & $n$  & $n$ digits of $e$ (factorial base) \\
+imaginary & \code{wheel-sieve1} & $n$  & $n$th prime (lazy wheel sieve) \\
+imaginary & \code{paraffins}    & $n$  & radical / paraffin counts up to $n$ \\
+imaginary & \code{bernouilli}   & $n$  & $n$th Bernoulli number \\
+spectral  & \code{primetest}    & $p$  & is \(2^{p}-1\) (Mersenne) prime? \\
+spectral  & \code{sorting}      & $n$  & run 8 sorts on $n$ integers, check agreement \\
+\bottomrule
+\end{tabular}
+\caption{The thirteen ported benchmarks.}
+\label{tab:benches}
+\end{table}
+
+\subsection{Direct ports}
+\code{tak}, \code{rfib}, \code{primes}, and \code{queens} are close translations.
+\code{tak} computes \(\mathrm{tak}\,(3n)\,(2n)\,n\) so that \(n=8\) gives the
+canonical \(\mathrm{tak}\,24\,16\,8\). \code{rfib} computes the integer
+\(\mathrm{nfib}\) (the original returns a \code{Double}; with only \code{Integer}
+available we compute \(\mathrm{nfib}\,n = \mathrm{nfib}(n-1) + \mathrm{nfib}(n-2)
++ 1\), which counts calls). \code{primes} faithfully reproduces the deliberately
+slow \(\textit{map head}\,(\textit{iterate the\_filter}\,[2\,..\,n^2])\,!!\,n\).
+\code{queens} reproduces the LML formulation \(\textit{nsoln}\;nq =
+\textit{length}\,(\textit{gen}\;nq)\) with the list comprehension in \code{gen}
+desugared to nested \code{concatMap}.
+
+\subsection{\texorpdfstring{\texttt{exp3\_8}}{exp3\_8}: Peano arithmetic}
+A faithful port: naturals are \code{data Nat = Z | S Nat}, with addition and
+multiplication on \code{Nat}, and \(3^{n}\) computed by repeated multiplication.
+The result is converted back to an \code{Integer} for printing (\(3^{8}=6561\)).
+Because the representation is unary, the \code{slow} workload (\(3^{16}\approx
+4.3\times 10^{7}\) constructors) requires a multi-gigabyte heap; this is by
+design, exercising allocation.
+
+\subsection{\texorpdfstring{\texttt{gen\_regexps}}{gen\_regexps}: strings as code points}
+The expansion of a generalised regular expression is computed over
+\code{[Integer]} (lists of character codes) rather than \code{String}, because
+PureLang strings are not lists of characters. Following the RJE variant noted in
+the original source, the program prints the \emph{number of characters} produced
+rather than the (potentially enormous) expansions themselves; this is
+deterministic and avoids huge output.
+
+\subsection{\texttt{digits-of-e1}: continued-fraction spigot}
+A close port of the Thurston algorithm: the linear-fractional transformation
+\code{ratTrans} operates on a four-tuple of \code{Integer} and the continued
+fraction of $e$. The only change is presentational---the digits are printed as
+\code{2.71828}\dots instead of being hashed.
+
+\subsection{\texttt{digits-of-e2}: strict \texttt{case} vs.\ lazy patterns}
+The Hughes factorial-base algorithm relies on a lazy irrefutable pattern
+(\code{nextcarry:fraction = carryPropagate (base+1) ds}) that is \emph{never
+forced past the end} of the otherwise-infinite stream. PureLang's \code{case} is
+strict, so we give \code{carryPropagate} an explicit base case for the empty
+list. Correctness is preserved because the algorithm already consumes a finite
+\(2n\)-element prefix as ``an upper bound on what the pipeline might consume'':
+processing that finite prefix strictly, with a terminating base case, yields the
+first $n$ digits correctly (the artificial boundary stays in the unused tail).
+
+\subsection{\texttt{wheel-sieve1}: untying the \texttt{primes} knot}
+This program defines \code{primes} self-referentially
+(\code{primes = sieve (wheels primes) primes (squares primes) n}); it works in
+Haskell only because the first element of each wheel's multiple-list,
+\code{s:[s*2,s*3..bound]}, is available \emph{without} forcing \code{bound}
+(which depends on \code{head primes}). Our first, naive desugaring used
+\code{enumFromTo 1 k0}, which forces \code{k0} immediately and produces a
+black hole (the program looped/aborted for all $n$). The fix mirrors the
+original's laziness exactly: the index list is written \code{1 : enumFromTo 2 k0}
+so that the first multiple is produced without forcing \code{k0}, untying the
+knot. The nested pattern \code{Wheel s ns : ws} is split into two \code{case}s.
+
+\subsection{\texttt{paraffins}: list memo for an array knot}
+The original memoises radical lists in a \code{Data.Array} defined in terms of
+itself. PureLang has no immutable arrays, so the memo is a lazy
+self-referential \emph{list} indexed by a recursive helper; this is well-founded
+because \code{rads_of_size_n} only ever indexes strictly smaller sizes. A key
+observation makes the port tractable: only the \emph{lengths} of the radical
+lists affect the reported counts, never the radical values, so each radical is
+represented by a dummy \code{0}. Outputs match OEIS A000602.
+
+\subsection{\texttt{bernouilli}: explicit rationals}
+\code{Data.Ratio} is replaced by \code{data Rat = Rat Integer Integer} with
+reduced fractions (positive denominator, divided through by \(\gcd\)). The
+self-referential infinite tables of the original (\code{powers},
+\code{neg_powers}, \code{pascal}) are reproduced directly, relying on
+PureLang's laziness; only finite prefixes are consumed. Output matches the
+\code{Ratio} \code{show} format, e.g.\ \texttt{5 \% 66}, and reproduces the known
+Bernoulli numbers.
+
+\subsection{\texttt{primetest}: big-integer modular exponentiation}
+The original runs a Rabin--Miller test on Mersenne numbers read from a file. We
+keep the bignum essence---square-and-multiply modular exponentiation---and test
+whether \(M_p = 2^{p}-1\) is prime using Miller--Rabin with a fixed set of small
+witnesses (deterministic and reproducible, avoiding a random-number generator).
+This is a probabilistic test in general but classifies all the Mersenne
+exponents in the workloads correctly.
+
+\subsection{\texttt{sorting}: eight sorts without file I/O}
+All eight sorts from the original (\code{quickSort}, \code{quickSort2},
+\code{quickerSort}, \code{insertSort}, \code{treeSort}, \code{treeSort2},
+\code{heapSort}, \code{mergeSort}) are ported over \code{[Integer]}. Lacking
+\code{readFile}, the program generates a deterministic scrambled list of $n$
+integers with a linear-congruential generator, runs all eight sorts, checks they
+agree, and prints a checksum. This exercises every sort on identical input and
+self-validates.
+
+\section{The driver: \texttt{run.py}}
+\label{sec:run}
+
+\code{run.py} discovers every benchmark (a directory containing
+\code{<name>.hs}), and for the chosen mode:
+\begin{enumerate}[nosep]
+  \item reads the workload argument from \code{sizes.cfg};
+  \item compiles the benchmark by invoking the existing \code{examples/Makefile}
+        target (so it uses whatever \code{pure}/\code{cake} the user has, and
+        forwards \code{PUREOPT} optimisation flags);
+  \item runs the resulting executable from \code{examples/out/}\dots with the
+        argument and a configurable CakeML heap size;
+  \item compares standard output byte-for-byte with the mode's reference file
+        and reports \textsc{pass}/\textsc{fail}.
+\end{enumerate}
+Useful invocations:
+\begin{lstlisting}
+./run.py                  # compile, run, check everything at norm
+./run.py --mode fast      # quick smoke test
+./run.py -k tak -k primes # only matching benchmarks
+./run.py --time --iterations 5   # best-of-5 wall-clock timing
+./run.py --no-compile     # reuse already-built executables
+./run.py --list           # list benchmarks
+\end{lstlisting}
+The default heap is 4096~MB because the \code{slow} workloads of \code{exp3_8}
+and \code{gen_regexps} need several gigabytes; the executable itself is
+independent of the mode, so \code{--no-compile} can be combined with any
+\code{--mode}.
+
+\section{Workload calibration}
+
+Sizes were chosen empirically so that, on the development machine, \code{norm}
+runs in roughly one to three seconds (consistent with \texttt{nofib}'s
+``norm'' intent), \code{fast} in a fraction of a second, and \code{slow} in a
+handful of seconds. Table~\ref{tab:sizes} lists the chosen arguments and the
+measured \code{norm} wall-clock time. Note the steep growth of some programs
+(\code{tak}, \code{paraffins}, \code{queens}), which constrains how far the
+\code{slow} sizes can be pushed.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lllll@{}}
+\toprule
+Name & fast & norm & slow & norm time (s) \\
+\midrule
+\code{tak}          & 8   & 9    & 10     & 2.13 \\
+\code{rfib}         & 28  & 34   & 37     & 1.31 \\
+\code{exp3_8}       & 11  & 14   & 16     & 0.66 \\
+\code{primes}       & 300 & 3000 & 5000   & 1.03 \\
+\code{queens}       & 9   & 11   & 12     & 2.80 \\
+\code{gen_regexps}  & \code{[a-z][a-z][0-9]} & \code{[a-z][a-z][a-z][a-z]} & \code{[a-z][a-z][a-z][a-z][0-3]} & 0.68 \\
+\code{digits-of-e1} & 100 & 800  & 1500   & 1.11 \\
+\code{digits-of-e2} & 100 & 900  & 1600   & 0.83 \\
+\code{wheel-sieve1} & 2000 & 60000 & 150000 & 1.63 \\
+\code{paraffins}    & 14  & 18   & 19     & 0.39 \\
+\code{bernouilli}   & 100 & 500  & 800    & 0.69 \\
+\code{primetest}    & 521 & 1279 & 2281   & 0.48 \\
+\code{sorting}      & 500 & 4000 & 10000  & 1.80 \\
+\bottomrule
+\end{tabular}
+\caption{Workload arguments per mode and measured norm-mode time.}
+\label{tab:sizes}
+\end{table}
+
+\section{What was not ported, and why}
+\label{sec:notported}
+
+\begin{description}[style=nextline,leftmargin=1em]
+  \item[Floating-point \texttt{imaginary} programs] \code{integrate},
+        \code{kahan}, and \code{x2n1} are intrinsically floating point and have
+        no faithful integer rendering; PureLang has no floating-point type.
+  \item[\texttt{wheel-sieve2}] The ``Mark~II'' sieve hinges on a lazy,
+        infinite \code{roll}/\code{dropWhile} spiral whose subtle demand
+        behaviour does not survive translation to strict \code{case}. Since
+        \code{wheel-sieve1} already represents the lazy-wheel-sieve family, the
+        marginal value did not justify the risk, and it is omitted.
+  \item[The \texttt{real} subset] These are application-scale programs requiring
+        a module system, file/standard input, and frequently floating point---
+        none of which PureLang currently offers.
+\end{description}
+
+\section{Reproduction}
+
+\begin{enumerate}[nosep]
+  \item Obtain a matching \code{pure}/\code{cake} pair. The robust route is to
+        build \code{pure.S} locally from \code{compiler/binary} against a CakeML
+        checkout, then build the \code{cake} binary from the same checkout.
+        Otherwise \code{make download} fetches prebuilt artifacts, subject to
+        the version-skew caveat of \S\ref{sec:toolchain}.
+  \item From \code{examples/benchmark/nofib}, run \code{./run.py --mode fast}
+        for a smoke test, then \code{./run.py} for the full norm-mode check.
+  \item To regenerate a reference after changing a benchmark, rebuild its
+        executable via the Makefile and redirect its output at the appropriate
+        size into the corresponding \code{*stdout} file (see the suite README).
+\end{enumerate}
+
+\section{Limitations and future work}
+
+The reported strings are close to, but not byte-identical with, GHC's
+\texttt{nofib} outputs: results are printed directly rather than hashed, and
+some programs print a derived summary (a character count, a checksum) rather
+than the full data. This is intentional and adequate for regression testing
+within PureCake, but means the suite is not a cross-implementation oracle. Should
+PureLang gain floating point, a module system, or type classes, the float-only
+\code{imaginary} programs, \code{wheel-sieve2}, and eventually parts of the
+\code{spectral} and \code{real} subsets become candidates for inclusion. The
+suite is structured so that adding a benchmark is mechanical: create a
+self-contained \code{.hs}, add a \code{sizes.cfg}, record three reference
+outputs, and confirm with \code{run.py}.
+
+\begin{thebibliography}{9}
+\bibitem{partain} W.~Partain. \emph{The \texttt{nofib} Benchmark Suite of
+  Haskell Programs}. In \emph{Functional Programming, Glasgow 1992}, British
+  Computer Society, 1993. (Included in this repository as \code{nofib.pdf}.)
+\end{thebibliography}
+
+\end{document}
